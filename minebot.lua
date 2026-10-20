@@ -67,9 +67,11 @@ local cfg = {
     minerEvery    = 8,
     mutationEvery = 12,
     enchantEvery  = 10,
-    travel        = true,  -- andar ate o altar/shrine antes de usar
-    travelRange   = 12,    -- distancia que ja conta como "chegou"
-    travelTimeout = 25,
+    travel        = true,   -- ir ate o altar/shrine antes de usar
+    travelMode    = "tp",   -- "tp" = CFrame direto, "walk" = caminhada
+    travelRange   = 12,     -- distancia que ja conta como "chegou"
+    travelTimeout = 25,     -- so vale no modo walk
+    returnAfter   = true,   -- volta pro ponto de mineracao depois de usar
     potions       = {},  -- nomes exatos de pocao pra usar sozinho; vazio = nenhuma
     sellKinds     = { Ore = true },  -- so minerio; bota Crate = true etc se quiser
     pauseEvery    = { 180, 420 },  -- a cada N swings, uma pausa curta
@@ -407,8 +409,19 @@ end
 -- enquanto true, o loop de mineracao para: senao os dois disputam o MoveTo
 local busy = false
 
--- caminha ate um objeto do mundo (EnchantAltar, SummonShrine).
--- Devolve true quando chega perto o bastante, false se nao deu no tempo.
+-- teleporte simples: escreve no CFrame do root.
+-- O anticheat do jogo nao olha posicao nem magnitude - so physics FPS,
+-- WalkSpeed/JumpPower e metamétodos - entao isso nao dispara nada dele.
+local function tpTo(pos)
+    local r = root()
+    if not (r and pos) then return false end
+    r.CFrame = CFrame.new(pos)
+    task.wait(0.25)
+    return true
+end
+
+-- vai ate um objeto do mundo (EnchantAltar, SummonShrine).
+-- Devolve true quando chega perto o bastante.
 local function goTo(inst, range, timeout)
     local target = inst and pivotOf(inst)
     if not target then return false end
@@ -417,6 +430,24 @@ local function goTo(inst, range, timeout)
     local r = root()
     if r and (r.Position - target).Magnitude <= range then
         return true
+    end
+
+    if cfg.travelMode == "tp" then
+        busy = true
+
+        local from = r and r.Position or (target + Vector3.new(0, 0, 10))
+        local dir = from - target
+        if dir.Magnitude < 1 then
+            dir = Vector3.new(0, 0, 1)
+        end
+
+        -- para alguns studs antes do objeto, nao dentro dele
+        tpTo(target + dir.Unit * math.min(range * 0.5, 6) + Vector3.new(0, 3, 0))
+        task.wait(0.4)
+
+        r = root()
+        busy = false
+        return (r ~= nil) and (r.Position - target).Magnitude <= range * 1.5
     end
 
     busy = true
@@ -466,13 +497,23 @@ task.spawn(function()
                     why.summon = "ilha do summon ainda bloqueada"
                 elseif scrolls < 1 then
                     why.summon = "sem scroll de summon"
-                elseif cfg.travel and not goTo(workspace:FindFirstChild("SummonShrine")) then
-                    why.summon = "nao cheguei no SummonShrine"
                 else
-                    why.summon = nil
-                    if send("MineSummon") then
-                        stats.summons += 1
-                        print("[minebot] summon (restavam " .. scrolls .. " scrolls)")
+                    local back = root() and root().Position or nil
+
+                    if cfg.travel and not goTo(workspace:FindFirstChild("SummonShrine")) then
+                        why.summon = "nao cheguei no SummonShrine"
+                    else
+                        why.summon = nil
+
+                        if send("MineSummon") then
+                            stats.summons += 1
+                            print("[minebot] summon (restavam " .. scrolls .. " scrolls)")
+                        end
+
+                        if cfg.travel and cfg.returnAfter and back then
+                            task.wait(1)
+                            tpTo(back)
+                        end
                     end
                 end
             end
@@ -716,13 +757,23 @@ task.spawn(function()
 
             if dice < 1 then
                 why.enchant = "sem dado de encantamento"
-            elseif cfg.travel and not goTo(workspace:FindFirstChild("EnchantAltar")) then
-                why.enchant = "nao cheguei no EnchantAltar"
             else
-                why.enchant = nil
-                if send("MineRollEnchant", 1) then
-                    stats.enchants += 1
-                    print("[minebot] rolou encantamento (tinha " .. dice .. " dados)")
+                local back = root() and root().Position or nil
+
+                if cfg.travel and not goTo(workspace:FindFirstChild("EnchantAltar")) then
+                    why.enchant = "nao cheguei no EnchantAltar"
+                else
+                    why.enchant = nil
+
+                    if send("MineRollEnchant", 1) then
+                        stats.enchants += 1
+                        print("[minebot] rolou encantamento (tinha " .. dice .. " dados)")
+                    end
+
+                    if cfg.travel and cfg.returnAfter and back then
+                        task.wait(1)
+                        tpTo(back)
+                    end
                 end
             end
         end
