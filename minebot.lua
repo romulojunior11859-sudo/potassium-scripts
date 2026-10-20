@@ -60,16 +60,35 @@ local cfg = {
     pickaxeEvery  = 20,
     zoneEvery     = 25,
     skillEvery    = 10,
+    summonEvery   = 6,
+    crateEvery    = 9,   -- o jogo trava 8s entre aberturas
+    potionEvery   = 15,
+    mysteryEvery  = 5,
+    minerEvery    = 8,
+    potions       = {},  -- nomes exatos de pocao pra usar sozinho; vazio = nenhuma
     sellKinds     = { Ore = true },  -- so minerio; bota Crate = true etc se quiser
     pauseEvery    = { 180, 420 },  -- a cada N swings, uma pausa curta
     pauseFor      = { 0.6, 2.2 },
 }
 
-local state = { mine = false, chest = false, sell = false, equip = false, pickaxe = false, zone = false, skill = false }
-local stats = { swings = 0, sells = 0, chests = 0, picks = 0, zones = 0, skills = 0, started = os.clock() }
+local state = {
+    mine = false, chest = false, sell = false, equip = false,
+    pickaxe = false, zone = false, skill = false,
+    summon = false, crate = false, potion = false, mystery = false,
+    miner = false,
+}
+local stats = {
+    swings = 0, sells = 0, chests = 0, picks = 0, zones = 0, skills = 0,
+    summons = 0, crates = 0, potions = 0, mysteries = 0, miners = 0, started = os.clock(),
+}
 
 local okCfg,   MineConfig = pcall(function() return require(RS.Modules.MineConfig) end)
 local okStock, MineStock  = pcall(function() return require(RS.Modules.MineStock) end)
+local okSum,   SummonCat  = pcall(function() return require(RS.Modules.MineSummonCatalog) end)
+local okCrate, CrateConf  = pcall(function() return require(RS.Modules.MineCrateConfig) end)
+
+-- motivo de cada modo ligado nao estar disparando, mostrado no painel
+local why = {}
 
 -- ---------------- helpers ----------------
 local function root()
@@ -372,6 +391,216 @@ task.spawn(function()
     end
 end)
 
+-- helper: devolve (dataCompleto, mineGame)
+local function bothData()
+    local ok, data = pcall(GameState.GetData2)
+    if not ok or type(data) ~= "table" then return nil, nil end
+    return data, (type(data.MineGame) == "table" and data.MineGame or nil)
+end
+
+-- summon: tres portas - ilha liberada, pelo menos 1 scroll, e o altar no mundo
+task.spawn(function()
+    while true do
+        task.wait(cfg.summonEvery)
+        if state.summon then
+            local d, mine = bothData()
+            if mine then
+                local unlocked = true
+                if okSum and type(SummonCat) == "table" and SummonCat.Unlocked then
+                    local okU, res = pcall(SummonCat.Unlocked, d)
+                    unlocked = okU and res and true or false
+                end
+
+                local scrolls = 0
+                if okCfg and MineConfig.GetSummonScrollCount then
+                    local okS, n = pcall(MineConfig.GetSummonScrollCount, mine)
+                    if okS then scrolls = tonumber(n) or 0 end
+                end
+
+                if not unlocked then
+                    why.summon = "ilha do summon ainda bloqueada"
+                elseif scrolls < 1 then
+                    why.summon = "sem scroll de summon"
+                else
+                    why.summon = nil
+                    if send("MineSummon") then
+                        stats.summons += 1
+                        print("[minebot] summon (restavam " .. scrolls .. " scrolls)")
+                    end
+                end
+            end
+        end
+    end
+end)
+
+-- crates: abre ate MaxOpen de uma vez, respeitando a trava de 8s do jogo
+task.spawn(function()
+    while true do
+        task.wait(cfg.crateEvery)
+        if state.crate then
+            if not (okInv and MineInventory and MineInventory.CrateEntries) then
+                why.crate = "MineInventory sem CrateEntries"
+            else
+                local _, mine = bothData()
+                local okE, entries = pcall(MineInventory.CrateEntries, mine)
+
+                if not okE or type(entries) ~= "table" then
+                    why.crate = "nao consegui listar crates"
+                else
+                    local maxOpen = 1
+                    if okCrate and type(CrateConf) == "table" then
+                        maxOpen = tonumber(CrateConf.MaxOpen) or 1
+                    end
+
+                    local sent = false
+                    for _, e in pairs(entries) do
+                        if type(e) == "table" then
+                            local count = tonumber(e.Count) or 0
+                            local name = e.Name or e.Key
+                            if name and count > 0 then
+                                local n = math.min(count, maxOpen)
+                                if send("MineOpenColossusCrate", name, n) then
+                                    stats.crates += n
+                                    print("[minebot] abriu " .. n .. "x " .. tostring(name))
+                                    sent = true
+                                end
+                                break
+                            end
+                        end
+                    end
+                    why.crate = sent and nil or "nenhuma crate no inventario"
+                end
+            end
+        end
+    end
+end)
+
+-- pocoes: so as listadas em cfg.potions, e so se tiver no inventario
+task.spawn(function()
+    while true do
+        task.wait(cfg.potionEvery)
+        if state.potion then
+            if next(cfg.potions) == nil then
+                why.potion = "cfg.potions esta vazia"
+            else
+                local _, mine = bothData()
+                local used = false
+
+                for _, name in ipairs(cfg.potions) do
+                    local have = 0
+                    if okCfg and MineConfig.GetPotionCount then
+                        local okP, n = pcall(MineConfig.GetPotionCount, mine, name)
+                        if okP then have = tonumber(n) or 0 end
+                    end
+
+                    if have > 0 then
+                        if send("MineUsePotion", name, 1) then
+                            stats.potions += 1
+                            print("[minebot] usou pocao: " .. tostring(name))
+                            used = true
+                        end
+                        break
+                    end
+                end
+                why.potion = used and nil or "nenhuma das pocoes listadas no inventario"
+            end
+        end
+    end
+end)
+
+-- mystery block: so abre o que estiver EQUIPADO, igual ao heldBlock do jogo
+task.spawn(function()
+    while true do
+        task.wait(cfg.mysteryEvery)
+        if state.mystery then
+            local _, mine = bothData()
+            if mine then
+                local equipped = mine.Equipped
+                local label = (type(equipped) == "string" and equipped ~= ""
+                    and type(mine.Hotbar) == "table") and mine.Hotbar[equipped] or nil
+
+                local block
+                if label and okCfg and MineConfig.GetMysteryBlockByLabel then
+                    local okB, b = pcall(MineConfig.GetMysteryBlockByLabel, label)
+                    if okB then block = b end
+                end
+
+                if not block then
+                    why.mystery = "equipa um mystery block no hotbar"
+                else
+                    why.mystery = nil
+                    local key = block.Key or label
+                    if send("MineOpenMysteryBlock", key) then
+                        stats.mysteries += 1
+                        print("[minebot] abriu mystery block: " .. tostring(key))
+                    end
+                end
+            end
+        end
+    end
+end)
+
+-- upgrade dos miners (os "pets" dos slots M1..N).
+-- Em vez de recalcular o custo, ele tenta e observa o nivel: se nao subiu,
+-- o slot entra em espera - e sinal de sem dinheiro ou nivel maximo.
+local lastLevel, stalled = {}, {}
+
+task.spawn(function()
+    while true do
+        task.wait(cfg.minerEvery)
+        if state.miner then
+            local _, mine = bothData()
+            local holders = mine and type(mine.Holders) == "table" and mine.Holders or nil
+
+            if not holders or next(holders) == nil then
+                why.miner = "nenhum miner nos slots"
+            else
+                local now = os.clock()
+                local picked, pickedLevel
+
+                for key, holder in pairs(holders) do
+                    if type(holder) == "table" and holder.CharName then
+                        local level = tonumber(holder.Level) or 0
+
+                        -- subiu desde a ultima tentativa? tira da espera
+                        if lastLevel[key] and level > lastLevel[key] then
+                            stalled[key] = nil
+                        end
+
+                        if not stalled[key] or now >= stalled[key] then
+                            if not pickedLevel or level < pickedLevel then
+                                picked, pickedLevel = key, level
+                            end
+                        end
+                    end
+                end
+
+                if not picked then
+                    why.miner = "todos os slots em espera (max ou sem dinheiro)"
+                else
+                    why.miner = nil
+                    local before = pickedLevel
+                    lastLevel[picked] = before
+
+                    if send("MineUpgradeCharacter", picked) then
+                        task.wait(1.5)
+                        local _, after = bothData()
+                        local nowLevel = after and after.Holders and after.Holders[picked]
+                            and tonumber(after.Holders[picked].Level) or before
+
+                        if nowLevel > before then
+                            stats.miners += 1
+                            print("[minebot] " .. picked .. " subiu pro nivel " .. nowLevel)
+                        else
+                            stalled[picked] = os.clock() + 60
+                        end
+                    end
+                end
+            end
+        end
+    end
+end)
+
 -- ---------------- UI ----------------
 local function uiParent()
     if type(gethui) == "function" then
@@ -405,8 +634,8 @@ gui.DisplayOrder = 9999
 gui.Parent = parent
 
 local main = Instance.new("Frame")
-main.Size = UDim2.fromOffset(300, 448)
-main.Position = UDim2.new(0, 24, 0.5, -224)
+main.Size = UDim2.fromOffset(312, 580)
+main.Position = UDim2.new(0, 24, 0.5, -290)
 main.BackgroundColor3 = BG
 main.BorderSizePixel = 0
 main.Parent = gui
@@ -455,10 +684,10 @@ closeBtn.MouseButton1Click:Connect(function()
     gui:Destroy()
 end)
 
-local y = 44
+local y = 42
 local function toggle(label, key)
     local row = Instance.new("TextButton")
-    row.Size = UDim2.new(1, -24, 0, 32)
+    row.Size = UDim2.new(1, -24, 0, 26)
     row.Position = UDim2.fromOffset(12, y)
     row.BackgroundColor3 = ROW
     row.BorderSizePixel = 0
@@ -480,15 +709,15 @@ local function toggle(label, key)
     name.Parent = row
 
     local led = Instance.new("Frame")
-    led.Size = UDim2.fromOffset(42, 18)
-    led.Position = UDim2.new(1, -52, 0, 7)
+    led.Size = UDim2.fromOffset(36, 16)
+    led.Position = UDim2.new(1, -46, 0, 5)
     led.BackgroundColor3 = OFF
     led.BorderSizePixel = 0
     led.Parent = row
     Instance.new("UICorner", led).CornerRadius = UDim.new(0, 9)
 
     local knob = Instance.new("Frame")
-    knob.Size = UDim2.fromOffset(14, 14)
+    knob.Size = UDim2.fromOffset(12, 12)
     knob.Position = UDim2.fromOffset(2, 2)
     knob.BackgroundColor3 = TEXT
     knob.BorderSizePixel = 0
@@ -498,11 +727,11 @@ local function toggle(label, key)
     row.MouseButton1Click:Connect(function()
         state[key] = not state[key]
         led.BackgroundColor3 = state[key] and ON or OFF
-        knob.Position = state[key] and UDim2.fromOffset(26, 2) or UDim2.fromOffset(2, 2)
+        knob.Position = state[key] and UDim2.fromOffset(22, 2) or UDim2.fromOffset(2, 2)
         print("[minebot] " .. label .. ": " .. tostring(state[key]))
     end)
 
-    y += 38
+    y += 30
 end
 
 toggle("auto minerar", "mine")
@@ -512,11 +741,16 @@ toggle("auto equipar", "equip")
 toggle("auto picareta", "pickaxe")
 toggle("auto caverna", "zone")
 toggle("auto skill", "skill")
+toggle("auto summon", "summon")
+toggle("auto crate", "crate")
+toggle("auto pocao", "potion")
+toggle("auto mystery", "mystery")
+toggle("auto miner", "miner")
 
 local info = Instance.new("TextLabel")
 info.BackgroundTransparency = 1
 info.Position = UDim2.fromOffset(12, y + 4)
-info.Size = UDim2.new(1, -24, 0, 124)
+info.Size = UDim2.new(1, -24, 0, 150)
 info.Font = FONT
 info.Text = ""
 info.TextSize = 12
@@ -539,6 +773,14 @@ task.spawn(function()
             stats.zones, stats.skills,
             d and tostring(d.CurrentZone or "?") or "?"
         )
+
+        local pend = {}
+        for mode, reason in pairs(why) do
+            if state[mode] and reason then pend[#pend + 1] = mode .. ": " .. reason end
+        end
+        if #pend > 0 then
+            info.Text = info.Text .. "\n\n" .. table.concat(pend, "\n")
+        end
         task.wait(0.5)
     end
 end)
