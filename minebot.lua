@@ -58,13 +58,15 @@ local cfg = {
     sellEvery     = 30,
     equipEvery    = 60,
     pickaxeEvery  = 20,
+    zoneEvery     = 25,
+    skillEvery    = 10,
     sellKinds     = { Ore = true },  -- so minerio; bota Crate = true etc se quiser
     pauseEvery    = { 180, 420 },  -- a cada N swings, uma pausa curta
     pauseFor      = { 0.6, 2.2 },
 }
 
-local state = { mine = false, chest = false, sell = false, equip = false, pickaxe = false }
-local stats = { swings = 0, sells = 0, chests = 0, picks = 0, started = os.clock() }
+local state = { mine = false, chest = false, sell = false, equip = false, pickaxe = false, zone = false, skill = false }
+local stats = { swings = 0, sells = 0, chests = 0, picks = 0, zones = 0, skills = 0, started = os.clock() }
 
 local okCfg,   MineConfig = pcall(function() return require(RS.Modules.MineConfig) end)
 local okStock, MineStock  = pcall(function() return require(RS.Modules.MineStock) end)
@@ -286,6 +288,90 @@ task.spawn(function()
     end
 end)
 
+-- compra de caverna: a primeira zona bloqueada na ordem de MineConfig.ZoneKeys,
+-- quando o dinheiro cobre o UnlockCost. Vai na ordem porque a zona anterior
+-- e pre-requisito (ZoneResearchGateFor). Selecionar a zona e o proprio caminho
+-- de compra: nao existe evento separado pra isso.
+task.spawn(function()
+    while true do
+        task.wait(cfg.zoneEvery)
+        if state.zone then
+            if not (okCfg and type(MineConfig) == "table" and type(MineConfig.ZoneKeys) == "table") then
+                warn("[minebot] MineConfig indisponivel - auto caverna desligado")
+                state.zone = false
+            else
+                local ok, data = pcall(GameState.GetData2)
+                local d = (ok and type(data) == "table") and data or nil
+                local mine = d and type(d.MineGame) == "table" and d.MineGame or nil
+
+                if mine then
+                    local money = tonumber(d.Money) or 0
+                    local unlocked = mine.UnlockedZones or {}
+
+                    for _, key in ipairs(MineConfig.ZoneKeys) do
+                        if not unlocked[key] then
+                            local zone = (MineConfig.Zones or {})[key]
+                            local cost = tonumber(zone and zone.UnlockCost)
+                            if cost and cost <= money then
+                                if send("MineSelectZone", key) then
+                                    stats.zones += 1
+                                    print("[minebot] comprou caverna: " ..
+                                        tostring(zone.DisplayName or key))
+                                end
+                            end
+                            break  -- so a proxima da fila importa
+                        end
+                    end
+                end
+            end
+        end
+    end
+end)
+
+-- arvore de habilidade: compra um no por vez, usando as mesmas checagens
+-- do botao original (aberto e nao maximizado).
+task.spawn(function()
+    while true do
+        task.wait(cfg.skillEvery)
+        if state.skill then
+            if not (okCfg and type(MineConfig) == "table" and MineConfig.GetSkillNodes) then
+                warn("[minebot] MineConfig sem arvore de skill - desligado")
+                state.skill = false
+            else
+                local ok, data = pcall(GameState.GetData2)
+                local d = (ok and type(data) == "table") and data or nil
+                local mine = d and type(d.MineGame) == "table" and d.MineGame or nil
+
+                if mine then
+                    local zoneKey = "Z" .. tostring(mine.CurrentZone or 1)
+                    local unlocked = mine.UnlockedZones or {}
+
+                    if unlocked[zoneKey] then
+                        local skills = (mine.Skills or {})[zoneKey] or {}
+                        local okNodes, nodes = pcall(MineConfig.GetSkillNodes, zoneKey)
+
+                        if okNodes and type(nodes) == "table" then
+                            for _, node in ipairs(nodes) do
+                                local okM, maxed = pcall(MineConfig.IsSkillNodeMaxed, skills, node)
+                                local okO, open  = pcall(MineConfig.IsSkillNodeOpen, skills, node)
+
+                                if okM and okO and open and not maxed then
+                                    if send("MineBuySkill", zoneKey, node.Family, node.Id) then
+                                        stats.skills += 1
+                                        print("[minebot] skill: " ..
+                                            tostring(node.Name or node.Id) .. " (" .. zoneKey .. ")")
+                                    end
+                                    break
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+end)
+
 -- ---------------- UI ----------------
 local function uiParent()
     if type(gethui) == "function" then
@@ -319,8 +405,8 @@ gui.DisplayOrder = 9999
 gui.Parent = parent
 
 local main = Instance.new("Frame")
-main.Size = UDim2.fromOffset(300, 372)
-main.Position = UDim2.new(0, 24, 0.5, -186)
+main.Size = UDim2.fromOffset(300, 448)
+main.Position = UDim2.new(0, 24, 0.5, -224)
 main.BackgroundColor3 = BG
 main.BorderSizePixel = 0
 main.Parent = gui
@@ -424,11 +510,13 @@ toggle("auto bau", "chest")
 toggle("auto vender", "sell")
 toggle("auto equipar", "equip")
 toggle("auto picareta", "pickaxe")
+toggle("auto caverna", "zone")
+toggle("auto skill", "skill")
 
 local info = Instance.new("TextLabel")
 info.BackgroundTransparency = 1
 info.Position = UDim2.fromOffset(12, y + 4)
-info.Size = UDim2.new(1, -24, 0, 100)
+info.Size = UDim2.new(1, -24, 0, 124)
 info.Font = FONT
 info.Text = ""
 info.TextSize = 12
@@ -443,11 +531,12 @@ task.spawn(function()
         local mins = math.max((os.clock() - stats.started) / 60, 0.01)
         local d = mineData()
         info.Text = string.format(
-            "nodes no plot: %d\nnode mais perto: %s\nswings: %d  (%.0f/min)\nbaus: %d   vendidos: %d   picaretas: %d\nzona: %s",
+            "nodes no plot: %d\nnode mais perto: %s\nswings: %d  (%.0f/min)\nbaus: %d   vendidos: %d   picaretas: %d\ncavernas: %d   skills: %d\nzona: %s",
             #nodeList(),
             dist and string.format("%.1f studs", dist) or "-",
             stats.swings, stats.swings / mins,
             stats.chests, stats.sells, stats.picks,
+            stats.zones, stats.skills,
             d and tostring(d.CurrentZone or "?") or "?"
         )
         task.wait(0.5)
