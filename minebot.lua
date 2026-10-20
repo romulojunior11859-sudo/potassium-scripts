@@ -65,6 +65,8 @@ local cfg = {
     potionEvery   = 15,
     mysteryEvery  = 5,
     minerEvery    = 8,
+    mutationEvery = 12,
+    enchantEvery  = 10,
     potions       = {},  -- nomes exatos de pocao pra usar sozinho; vazio = nenhuma
     sellKinds     = { Ore = true },  -- so minerio; bota Crate = true etc se quiser
     pauseEvery    = { 180, 420 },  -- a cada N swings, uma pausa curta
@@ -75,11 +77,12 @@ local state = {
     mine = false, chest = false, sell = false, equip = false,
     pickaxe = false, zone = false, skill = false,
     summon = false, crate = false, potion = false, mystery = false,
-    miner = false,
+    miner = false, mutation = false, enchant = false,
 }
 local stats = {
     swings = 0, sells = 0, chests = 0, picks = 0, zones = 0, skills = 0,
-    summons = 0, crates = 0, potions = 0, mysteries = 0, miners = 0, started = os.clock(),
+    summons = 0, crates = 0, potions = 0, mysteries = 0, miners = 0,
+    mutations = 0, enchants = 0, started = os.clock(),
 }
 
 local okCfg,   MineConfig = pcall(function() return require(RS.Modules.MineConfig) end)
@@ -601,6 +604,85 @@ task.spawn(function()
     end
 end)
 
+-- mutacao: rola no slot. O cliente exige personagem no slot, slot destravado
+-- e dinheiro >= rollCost - mas rollCost e funcao local do jogo, entao aqui
+-- a gente tenta e olha o dinheiro: se nao caiu, o slot espera 60s.
+local mutStall = {}
+
+task.spawn(function()
+    while true do
+        task.wait(cfg.mutationEvery)
+        if state.mutation then
+            local d, mine = bothData()
+            local holders = mine and type(mine.Holders) == "table" and mine.Holders or nil
+
+            if not holders or next(holders) == nil then
+                why.mutation = "nenhum miner nos slots"
+            else
+                local now = os.clock()
+                local pick
+
+                for key, holder in pairs(holders) do
+                    if type(holder) == "table" and holder.CharName then
+                        if not mutStall[key] or now >= mutStall[key] then
+                            pick = key
+                            break
+                        end
+                    end
+                end
+
+                if not pick then
+                    why.mutation = "slots em espera (travados ou sem dinheiro)"
+                else
+                    why.mutation = nil
+                    local before = tonumber(d and d.Money) or 0
+
+                    if send("MineRollMutation", pick) then
+                        task.wait(2)
+                        local after = bothData()
+                        local money = tonumber(after and after.Money) or before
+
+                        if money < before then
+                            stats.mutations += 1
+                            print("[minebot] rolou mutacao em " .. pick)
+                        else
+                            mutStall[pick] = os.clock() + 60
+                        end
+                    end
+                end
+            end
+        end
+    end
+end)
+
+-- encantamento: um dado por vez, categoria generica.
+-- O altar fica no mundo (bindAltarPrompt), entao o servidor pode exigir
+-- que voce esteja perto dele - se nunca consumir dado, e isso.
+task.spawn(function()
+    while true do
+        task.wait(cfg.enchantEvery)
+        if state.enchant then
+            local _, mine = bothData()
+            local dice = 0
+
+            if okCfg and MineConfig.GetEnchantDiceCount then
+                local okD, n = pcall(MineConfig.GetEnchantDiceCount, mine)
+                if okD then dice = tonumber(n) or 0 end
+            end
+
+            if dice < 1 then
+                why.enchant = "sem dado de encantamento"
+            else
+                why.enchant = nil
+                if send("MineRollEnchant", 1) then
+                    stats.enchants += 1
+                    print("[minebot] rolou encantamento (tinha " .. dice .. " dados)")
+                end
+            end
+        end
+    end
+end)
+
 -- ---------------- UI ----------------
 local function uiParent()
     if type(gethui) == "function" then
@@ -634,8 +716,8 @@ gui.DisplayOrder = 9999
 gui.Parent = parent
 
 local main = Instance.new("Frame")
-main.Size = UDim2.fromOffset(312, 580)
-main.Position = UDim2.new(0, 24, 0.5, -290)
+main.Size = UDim2.fromOffset(312, 640)
+main.Position = UDim2.new(0, 24, 0.5, -320)
 main.BackgroundColor3 = BG
 main.BorderSizePixel = 0
 main.Parent = gui
@@ -746,6 +828,8 @@ toggle("auto crate", "crate")
 toggle("auto pocao", "potion")
 toggle("auto mystery", "mystery")
 toggle("auto miner", "miner")
+toggle("auto mutacao", "mutation")
+toggle("auto encanto", "enchant")
 
 local info = Instance.new("TextLabel")
 info.BackgroundTransparency = 1
