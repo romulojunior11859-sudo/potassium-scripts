@@ -67,6 +67,9 @@ local cfg = {
     minerEvery    = 8,
     mutationEvery = 12,
     enchantEvery  = 10,
+    travel        = true,  -- andar ate o altar/shrine antes de usar
+    travelRange   = 12,    -- distancia que ja conta como "chegou"
+    travelTimeout = 25,
     potions       = {},  -- nomes exatos de pocao pra usar sozinho; vazio = nenhuma
     sellKinds     = { Ore = true },  -- so minerio; bota Crate = true etc se quiser
     pauseEvery    = { 180, 420 },  -- a cada N swings, uma pausa curta
@@ -176,7 +179,7 @@ task.spawn(function()
         local delta = (math.random() - 0.5) * 2 * cfg.jitter * base
         task.wait(math.max(0.05, base + delta))
 
-        if state.mine then
+        if state.mine and not busy then
             local node, pos, dist = nearestNode()
             if node and pos then
                 if dist > cfg.maxDist then
@@ -401,6 +404,45 @@ local function bothData()
     return data, (type(data.MineGame) == "table" and data.MineGame or nil)
 end
 
+-- enquanto true, o loop de mineracao para: senao os dois disputam o MoveTo
+local busy = false
+
+-- caminha ate um objeto do mundo (EnchantAltar, SummonShrine).
+-- Devolve true quando chega perto o bastante, false se nao deu no tempo.
+local function goTo(inst, range, timeout)
+    local target = inst and pivotOf(inst)
+    if not target then return false end
+
+    range = range or cfg.travelRange
+    local r = root()
+    if r and (r.Position - target).Magnitude <= range then
+        return true
+    end
+
+    busy = true
+    local deadline = os.clock() + (timeout or cfg.travelTimeout)
+
+    while os.clock() < deadline do
+        local h = humanoid()
+        r = root()
+
+        if not (h and r) then
+            break
+        end
+
+        if (r.Position - target).Magnitude <= range then
+            busy = false
+            return true
+        end
+
+        h:MoveTo(target)
+        task.wait(0.35)
+    end
+
+    busy = false
+    return false
+end
+
 -- summon: tres portas - ilha liberada, pelo menos 1 scroll, e o altar no mundo
 task.spawn(function()
     while true do
@@ -424,6 +466,8 @@ task.spawn(function()
                     why.summon = "ilha do summon ainda bloqueada"
                 elseif scrolls < 1 then
                     why.summon = "sem scroll de summon"
+                elseif cfg.travel and not goTo(workspace:FindFirstChild("SummonShrine")) then
+                    why.summon = "nao cheguei no SummonShrine"
                 else
                     why.summon = nil
                     if send("MineSummon") then
@@ -672,6 +716,8 @@ task.spawn(function()
 
             if dice < 1 then
                 why.enchant = "sem dado de encantamento"
+            elseif cfg.travel and not goTo(workspace:FindFirstChild("EnchantAltar")) then
+                why.enchant = "nao cheguei no EnchantAltar"
             else
                 why.enchant = nil
                 if send("MineRollEnchant", 1) then
