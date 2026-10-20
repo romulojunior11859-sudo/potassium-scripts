@@ -17,6 +17,27 @@ local MarketplaceService = game:GetService("MarketplaceService")
 
 local lp = Players.LocalPlayer
 
+-- ---------------- acesso ----------------
+-- so quem estiver aqui consegue rodar.
+local WHITELIST = {
+    -- [123456789] = "meu alt",
+}
+
+do
+    local id = lp.UserId
+    if next(WHITELIST) == nil or not WHITELIST[id] then
+        warn("[passpreview] acesso negado - UserId " .. tostring(id))
+        pcall(function()
+            game:GetService("StarterGui"):SetCore("SendNotification", {
+                Title = "passpreview",
+                Text = "acesso negado - UserId " .. tostring(id),
+                Duration = 8,
+            })
+        end)
+        return
+    end
+end
+
 -- funcoes de hook do executor
 local F_hookmeta  = hookmetamethod
 local F_namecall  = getnamecallmethod

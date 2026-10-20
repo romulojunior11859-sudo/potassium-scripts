@@ -17,6 +17,28 @@ local UIS        = game:GetService("UserInputService")
 
 local lp = Players.LocalPlayer
 
+-- ---------------- acesso ----------------
+-- vazia = qualquer um roda. preenchida = so quem esta na lista.
+-- o UserId aparece em roblox.com/users/<id>/profile, ou no aviso de acesso negado.
+local WHITELIST = {
+    -- [123456789] = "meu alt",
+}
+
+do
+    local id = lp.UserId
+    if next(WHITELIST) ~= nil and not WHITELIST[id] then
+        warn("[minebot] acesso negado - UserId " .. tostring(id))
+        pcall(function()
+            game:GetService("StarterGui"):SetCore("SendNotification", {
+                Title = "minebot",
+                Text = "acesso negado - UserId " .. tostring(id),
+                Duration = 8,
+            })
+        end)
+        return
+    end
+end
+
 local okGS, GameState = pcall(function() return require(RS.Modules.GameState) end)
 if not okGS or type(GameState) ~= "table" then
     warn("[minebot] nao consegui require do GameState - o jogo mudou de estrutura")
@@ -35,12 +57,17 @@ local cfg = {
     chestEvery    = 5,
     sellEvery     = 30,
     equipEvery    = 60,
+    pickaxeEvery  = 20,
+    sellKinds     = { Ore = true },  -- so minerio; bota Crate = true etc se quiser
     pauseEvery    = { 180, 420 },  -- a cada N swings, uma pausa curta
     pauseFor      = { 0.6, 2.2 },
 }
 
-local state = { mine = false, chest = false, sell = false, equip = false }
-local stats = { swings = 0, sells = 0, chests = 0, started = os.clock() }
+local state = { mine = false, chest = false, sell = false, equip = false, pickaxe = false }
+local stats = { swings = 0, sells = 0, chests = 0, picks = 0, started = os.clock() }
+
+local okCfg,   MineConfig = pcall(function() return require(RS.Modules.MineConfig) end)
+local okStock, MineStock  = pcall(function() return require(RS.Modules.MineStock) end)
 
 -- ---------------- helpers ----------------
 local function root()
@@ -163,20 +190,34 @@ end)
 task.spawn(function()
     while true do
         task.wait(cfg.sellEvery)
-        if state.sell and okInv and type(MineInventory) == "table" and MineInventory.Collect then
-            local d = mineData()
-            if d then
-                local ok, entries = pcall(function()
-                    local order = MineInventory.KindOrder and MineInventory.KindOrder.OreFirst or nil
-                    return MineInventory.Collect(d, "All", order)
-                end)
-                if ok and type(entries) == "table" then
+        if state.sell then
+            if not (okInv and type(MineInventory) == "table" and MineInventory.Collect) then
+                warn("[minebot] MineInventory indisponivel - venda desligada")
+                state.sell = false
+            else
+                local d = mineData()
+                local ok, entries = pcall(MineInventory.Collect, d, "All", nil)
+                if not ok then
+                    warn("[minebot] Collect falhou: " .. tostring(entries))
+                elseif type(entries) ~= "table" then
+                    warn("[minebot] Collect nao devolveu tabela")
+                else
+                    -- as entradas usam Key/Kind maiusculos; o .key minusculo e do tile da UI
                     local keys = {}
                     for _, e in pairs(entries) do
-                        if type(e) == "table" and e.key then keys[#keys + 1] = e.key end
+                        if type(e) == "table" then
+                            local key = e.Key or e.key
+                            local kind = e.Kind or e.kind
+                            if key and (cfg.sellKinds[kind] or next(cfg.sellKinds) == nil) then
+                                keys[#keys + 1] = key
+                            end
+                        end
                     end
                     if #keys > 0 then
-                        if send("MineSellItems", keys) then stats.sells += #keys end
+                        if send("MineSellItems", keys) then
+                            stats.sells += #keys
+                            print("[minebot] vendeu " .. #keys .. " item(ns)")
+                        end
                     end
                 end
             end
@@ -188,6 +229,60 @@ task.spawn(function()
     while true do
         task.wait(cfg.equipEvery)
         if state.equip then send("MineEquipBest") end
+    end
+end)
+
+-- compra de picareta: mesmas regras que o HUD usa pra habilitar o botao
+-- (zona desbloqueada + estoque + dinheiro). Nao precisa estar perto de nada.
+task.spawn(function()
+    while true do
+        task.wait(cfg.pickaxeEvery)
+        if state.pickaxe then
+            if not (okCfg and type(MineConfig) == "table" and type(MineConfig.Pickaxes) == "table") then
+                warn("[minebot] MineConfig indisponivel - compra desligada")
+                state.pickaxe = false
+            else
+                local ok, data = pcall(GameState.GetData2)
+                local d = (ok and type(data) == "table") and data or nil
+                local mine = d and type(d.MineGame) == "table" and d.MineGame or nil
+
+                if mine then
+                    local money = tonumber(d.Money) or 0
+                    local unlocked = mine.UnlockedZones or {}
+                    local bestIndex, bestCost, bestName
+
+                    for i, def in ipairs(MineConfig.Pickaxes) do
+                        local skip = (MineConfig.IsPickaxeFree and MineConfig.IsPickaxeFree(def))
+                            or def.RobuxOnly or type(def.Stock) ~= "table"
+
+                        if not skip and unlocked[def.ZoneReq] then
+                            local cost = tonumber(def.Cost)
+                            local remaining = nil
+                            if okStock and MineStock and MineStock.GetRemaining then
+                                local okR, r = pcall(MineStock.GetRemaining, d, def.Name)
+                                if okR then remaining = r end
+                            end
+
+                            local inStock = (remaining == nil) or (remaining > 0)
+                            if cost and inStock and cost <= money then
+                                if not bestCost or cost > bestCost then
+                                    bestIndex, bestCost, bestName = i, cost, def.Name
+                                end
+                            end
+                        end
+                    end
+
+                    if bestIndex then
+                        if send("MineBuyPickaxe", bestIndex) then
+                            stats.picks += 1
+                            print("[minebot] comprou picareta: " .. tostring(bestName))
+                            task.wait(1)
+                            send("MineEquipBest")
+                        end
+                    end
+                end
+            end
+        end
     end
 end)
 
@@ -224,8 +319,8 @@ gui.DisplayOrder = 9999
 gui.Parent = parent
 
 local main = Instance.new("Frame")
-main.Size = UDim2.fromOffset(300, 330)
-main.Position = UDim2.new(0, 24, 0.5, -165)
+main.Size = UDim2.fromOffset(300, 372)
+main.Position = UDim2.new(0, 24, 0.5, -186)
 main.BackgroundColor3 = BG
 main.BorderSizePixel = 0
 main.Parent = gui
@@ -328,6 +423,7 @@ toggle("auto minerar", "mine")
 toggle("auto bau", "chest")
 toggle("auto vender", "sell")
 toggle("auto equipar", "equip")
+toggle("auto picareta", "pickaxe")
 
 local info = Instance.new("TextLabel")
 info.BackgroundTransparency = 1
@@ -347,11 +443,11 @@ task.spawn(function()
         local mins = math.max((os.clock() - stats.started) / 60, 0.01)
         local d = mineData()
         info.Text = string.format(
-            "nodes no plot: %d\nnode mais perto: %s\nswings: %d  (%.0f/min)\nbaus: %d   itens vendidos: %d\nzona: %s",
+            "nodes no plot: %d\nnode mais perto: %s\nswings: %d  (%.0f/min)\nbaus: %d   vendidos: %d   picaretas: %d\nzona: %s",
             #nodeList(),
             dist and string.format("%.1f studs", dist) or "-",
             stats.swings, stats.swings / mins,
-            stats.chests, stats.sells,
+            stats.chests, stats.sells, stats.picks,
             d and tostring(d.CurrentZone or "?") or "?"
         )
         task.wait(0.5)
