@@ -34,6 +34,17 @@ end
 
 local BoxService      = tryRequire(RS.Shared.Services.BoxService)
 local CurrencyService = tryRequire(RS.Shared.Services.CurrencyService)
+local PolisherService = tryRequire(RS.Shared.Services.PolisherService)
+local Constants       = tryRequire(RS.Shared.Constants)
+local Cooldowns       = tryRequire(RS.Shared.Constants.Cooldowns)
+
+-- chama funcao de service com seguranca, devolvendo nil se nao existir
+local function call(mod, fname, ...)
+    if type(mod) ~= "table" or type(mod[fname]) ~= "function" then return nil end
+    local ok, v = pcall(mod[fname], ...)
+    if ok then return v end
+    return nil
+end
 
 -- cache de remotes, resolvido sob demanda
 local remotes = {}
@@ -47,14 +58,20 @@ local function R(name, kind)
 end
 
 -- ---------------- config ----------------
+-- os tempos vem do proprio jogo (Constants.Cooldowns), nao de chute:
+--   CONVEYOR_ROLL_COOLDOWN = 1      EQUIP_BEST_FIGURES_COOLDOWN = 2
+--   PLAYER_UNIT_SHOWCASE_COLLECT_COOLDOWN = 0.75
+local CD = (type(Cooldowns) == "table") and Cooldowns or {}
+
 local cfg = {
-    collectEvery = 0.6,
+    collectEvery = CD.PLAYER_UNIT_SHOWCASE_COLLECT_COOLDOWN or 0.75,
     collectRange = 60,
     sellEvery    = 4,
-    polishEvery  = 3,
-    rollEvery    = 1.5,
+    polishEvery  = 5,
+    rollEvery    = CD.CONVEYOR_ROLL_COOLDOWN or 1,
+    rollMargin   = 0.15,  -- folga em cima do cooldown real
     claimEvery   = 60,
-    equipEvery   = 120,
+    equipEvery   = math.max(CD.EQUIP_BEST_FIGURES_COOLDOWN or 2, 60),
 }
 
 local state = {
@@ -94,18 +111,28 @@ local function near(inst, range)
     return (pos - r.Position).Magnitude <= (range or cfg.collectRange)
 end
 
+-- o nome certo e GetCurrencyAmount(player, "Cash") - os outros nao existem
 local function cash()
-    if type(CurrencyService) == "table" then
-        for _, f in ipairs({ "GetCurrency", "Get", "GetAmount" }) do
-            if type(CurrencyService[f]) == "function" then
-                local ok, v = pcall(CurrencyService[f], lp, "Cash")
-                if ok and tonumber(v) then return tonumber(v) end
-            end
-        end
-    end
+    local v = call(CurrencyService, "GetCurrencyAmount", lp, "Cash")
+    if tonumber(v) then return tonumber(v) end
+
     local ls = lp:FindFirstChild("leaderstats")
     local s = ls and (ls:FindFirstChild("Cash") or ls:FindFirstChild("Money"))
     return s and tonumber(s.Value) or nil
+end
+
+local function canAfford(price)
+    local v = call(CurrencyService, "CanAfford", lp, "Cash", price)
+    if type(v) == "boolean" then return v end
+    local money = cash()
+    return (money == nil) or (money >= price)
+end
+
+-- locker: ocupado / capacidade, direto do BoxService
+local function locker()
+    local used = call(BoxService, "GetTotalBoxInventoryAmount", lp)
+    local max  = call(BoxService, "GetMaxBoxInventorySpace", lp)
+    return tonumber(used), tonumber(max)
 end
 
 -- tudo que o jogo marca com esses atributos/nomes vira alvo de coleta
@@ -169,15 +196,32 @@ task.spawn(function()
     end
 end)
 
--- polidor: deposita e recolhe
+-- polidor: so age se estiver desbloqueado, e so recolhe se tiver caixa pronta.
+-- PolisherService.IsUnlocked / GetPendingCash / GetPolishedCash sao do jogo.
 task.spawn(function()
     while true do
         task.wait(cfg.polishEvery)
         if state.polish then
-            for _, inst in ipairs(workspace:GetDescendants()) do
-                if inst:IsA("BasePart") and inst.Name == "CollectPart" and near(inst, 40) then
-                    fireOnce(inst, "DepositCrate", 4)
-                    fireOnce(inst, "CollectPolisherCrate", 4)
+            local unlocked = call(PolisherService, "IsUnlocked", lp)
+            if unlocked == false then
+                say("polidor nao desbloqueado (CratePolisherUnlock)")
+            else
+                local pending  = tonumber(call(PolisherService, "GetPendingCash", lp)) or 0
+                local polished = tonumber(call(PolisherService, "GetPolishedCash", lp)) or 0
+
+                for _, inst in ipairs(workspace:GetDescendants()) do
+                    if inst:IsA("BasePart") and inst.Name == "CollectPart" and near(inst, 40) then
+                        -- so deposita se nao tem nada em processamento
+                        if pending <= 0 then
+                            fireOnce(inst, "DepositCrate", 4)
+                        end
+                        -- so recolhe se ja tem polido esperando
+                        if polished > 0 then
+                            if fireOnce(inst, "CollectPolisherCrate", 4) then
+                                say("recolheu do polidor: " .. tostring(polished))
+                            end
+                        end
+                    end
                 end
             end
         end
@@ -188,7 +232,10 @@ end)
 task.spawn(function()
     local armed = false
     while true do
-        task.wait(cfg.rollEvery)
+        -- cooldown real do jogador, nao numero fixo
+        local realCd = tonumber(call(BoxService, "GetConveyorRollCooldown", lp))
+        task.wait((realCd or cfg.rollEvery) + cfg.rollMargin)
+
         if state.roll then
             if not armed then
                 fire("RequestSetConveyorAutoBuy", true)
@@ -208,22 +255,15 @@ task.spawn(function()
             end
 
             if part then
-                local price
-                if type(BoxService) == "table" and type(BoxService.GetConveyorBoxPrice) == "function" then
-                    local ok, p = pcall(BoxService.GetConveyorBoxPrice, boxName, variant)
-                    if ok then price = tonumber(p) end
-                end
-
-                local money = cash()
-                local hasSpace = true
-                if type(BoxService) == "table" and type(BoxService.HasBoxInventorySpace) == "function" then
-                    local ok, s = pcall(BoxService.HasBoxInventorySpace, lp, 1)
-                    if ok then hasSpace = s and true or false end
-                end
+                local price = tonumber(call(BoxService, "GetConveyorBoxPrice", boxName, variant))
+                local hasSpace = call(BoxService, "HasBoxInventorySpace", lp, 1)
+                if hasSpace == nil then hasSpace = true end
 
                 if not hasSpace then
-                    say("locker cheio - vende antes")
-                elseif price and money and money < price then
+                    local used, max = locker()
+                    say(string.format("locker cheio (%s/%s) - vende antes",
+                        tostring(used or "?"), tostring(max or "?")))
+                elseif price and not canAfford(price) then
                     say("sem dinheiro pro roll (precisa " .. tostring(price) .. ")")
                 elseif price then
                     if fire("PurchaseConveyorRoll", boxName, variant, price) then
@@ -441,11 +481,17 @@ info.Parent = main
 task.spawn(function()
     while gui.Parent do
         local mins = math.max((os.clock() - stats.started) / 60, 0.01)
+        local used, max = locker()
+        local cd = tonumber(call(BoxService, "GetConveyorRollCooldown", lp))
+        local pend = tonumber(call(PolisherService, "GetPendingCash", lp))
+
         info.Text = string.format(
-            "cash: %s\ncoletado: %d (%.0f/min)  vendido: %d\nrolls: %d   recompensas: %d\n\n%s",
+            "cash: %s   locker: %s/%s\ncoletado: %d (%.0f/min)  vendido: %d\nrolls: %d (cd %ss)   recompensas: %d\npolidor pendente: %s\n\n%s",
             tostring(cash() or "?"),
+            tostring(used or "?"), tostring(max or "?"),
             stats.picked, stats.picked / mins, stats.sold,
-            stats.rolled, stats.claimed,
+            stats.rolled, tostring(cd or cfg.rollEvery), stats.claimed,
+            tostring(pend or "-"),
             table.concat(log, "\n")
         )
         task.wait(0.5)
