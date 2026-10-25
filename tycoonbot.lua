@@ -46,6 +46,13 @@ local function call(mod, fname, ...)
     return nil
 end
 
+-- thread nova nasce sem a identidade do executor, e escrever em instancia
+-- do gethui() exige capability. Toda thread chama isso na primeira linha.
+local F_identity = setthreadidentity or setidentity or set_thread_identity
+local function elevate()
+    if type(F_identity) == "function" then pcall(F_identity, 8) end
+end
+
 -- cache de remotes, resolvido sob demanda
 local remotes = {}
 local function R(name, kind)
@@ -156,6 +163,7 @@ end
 
 -- ---------------- loops ----------------
 task.spawn(function()
+    elevate()
     while true do
         task.wait(cfg.collectEvery)
         if state.collect then
@@ -176,6 +184,7 @@ end)
 
 -- venda: o cliente le o guid do que esta na mao
 task.spawn(function()
+    elevate()
     while true do
         task.wait(cfg.sellEvery)
         if state.sell then
@@ -199,6 +208,7 @@ end)
 -- polidor: so age se estiver desbloqueado, e so recolhe se tiver caixa pronta.
 -- PolisherService.IsUnlocked / GetPendingCash / GetPolishedCash sao do jogo.
 task.spawn(function()
+    elevate()
     while true do
         task.wait(cfg.polishEvery)
         if state.polish then
@@ -230,6 +240,7 @@ end)
 
 -- roll: preco real, e liga o auto-buy nativo do jogo
 task.spawn(function()
+    elevate()
     local armed = false
     while true do
         -- cooldown real do jogador, nao numero fixo
@@ -279,6 +290,7 @@ end)
 
 -- recompensas que o jogo da de graca
 task.spawn(function()
+    elevate()
     while true do
         task.wait(cfg.claimEvery)
         if state.claim then
@@ -298,6 +310,7 @@ task.spawn(function()
 end)
 
 task.spawn(function()
+    elevate()
     while true do
         task.wait(cfg.equipEvery)
         if state.equip then fire("EquipBestPlayerUnits") end
@@ -478,14 +491,17 @@ info.TextYAlignment = Enum.TextYAlignment.Top
 info.TextWrapped = true
 info.Parent = main
 
+local movedGui = false
+
 task.spawn(function()
+    elevate()
     while gui.Parent do
         local mins = math.max((os.clock() - stats.started) / 60, 0.01)
         local used, max = locker()
         local cd = tonumber(call(BoxService, "GetConveyorRollCooldown", lp))
         local pend = tonumber(call(PolisherService, "GetPendingCash", lp))
 
-        info.Text = string.format(
+        local texto = string.format(
             "cash: %s   locker: %s/%s\ncoletado: %d (%.0f/min)  vendido: %d\nrolls: %d (cd %ss)   recompensas: %d\npolidor pendente: %s\n\n%s",
             tostring(cash() or "?"),
             tostring(used or "?"), tostring(max or "?"),
@@ -494,6 +510,20 @@ task.spawn(function()
             tostring(pend or "-"),
             table.concat(log, "\n")
         )
+
+        -- se a escrita falhar por capability, muda o painel pra PlayerGui,
+        -- que e instancia comum e nao exige nada
+        local okWrite = pcall(function() info.Text = texto end)
+        if not okWrite and not movedGui then
+            movedGui = true
+            local pg = lp:FindFirstChildOfClass("PlayerGui")
+            if pg and pcall(function() gui.Parent = pg end) then
+                print("[tycoonbot] painel movido pro PlayerGui (capability)")
+            else
+                print("[tycoonbot] sem painel - acompanha pelo console")
+            end
+        end
+
         task.wait(0.5)
     end
 end)
